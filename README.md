@@ -41,7 +41,7 @@ Then edit `.env`:
 | `PORT`                                          | server          | Port the signaling/HTTP server listens on (default `3001`).         |
 | `CLIENT_ORIGIN`                                 | server          | CORS origin when the client is hosted separately.                   |
 | `VITE_SERVER_URL`                               | client (build)  | Socket server URL when not served from the same origin.             |
-| `VITE_TURN_URL` / `_USERNAME` / `_CREDENTIAL`   | client (build)  | TURN relay for strict-NAT peers, **strongly recommended in prod**. |
+| `TURN_URLS` / `TURN_USERNAME` / `TURN_CREDENTIAL` | server (runtime) | TURN relay for strict-NAT peers, **required in prod**. Served to the SPA by `GET /ice`. |
 
 **4. Start the dev servers**
 
@@ -100,7 +100,7 @@ The recommended zero-cost setup: static SPA on **Vercel**, Socket.IO signaling s
 2. Add the environment variable `VITE_SERVER_URL = https://syncroom-server.onrender.com` (build-time, set it **before** the first build, redeploy if you change it).
 3. Deploy. If your final Vercel domain differs from what you set in step 2.2, update `CLIENT_ORIGIN` on Render.
 
-**4. (Recommended) TURN for strict NATs**, create a free [Open Relay](https://www.metered.ca/tools/openrelay/) account and add `VITE_TURN_URL`, `VITE_TURN_USERNAME`, `VITE_TURN_CREDENTIAL` on Vercel, then redeploy. Without TURN, ~10–15% of peer pairs can't connect.
+**4. (Required for cross-network calls) TURN**, create a [Metered](https://www.metered.ca/) account and set `TURN_URLS`, `TURN_USERNAME` and `TURN_CREDENTIAL` on the **server** (they are served to the browser by `GET /ice`, so no client rebuild is needed). Without TURN, ~10–15% of peer pairs can't connect. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#turn-required-in-production).
 
 **5. (Optional) Kill the cold start**, Render free sleeps after 15 min idle (first join then waits ~50 s). Point a free [UptimeRobot](https://uptimerobot.com) monitor at `https://<your-server>/healthz` every 5 minutes; one always-on service fits within Render's 750 free hours/month.
 

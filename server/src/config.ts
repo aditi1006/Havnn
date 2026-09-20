@@ -21,6 +21,37 @@ function bool(name: string, fallback: boolean): boolean {
   return /^(1|true|yes|on)$/i.test(raw.trim());
 }
 
+function list(name: string, fallback: string[]): string[] {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parsed.length > 0 ? parsed : fallback;
+}
+
+function str(name: string, fallback: string): string {
+  return process.env[name]?.trim() || fallback;
+}
+
+/**
+ * Public STUN. Several servers, because a single unreachable one means no
+ * server-reflexive candidate at all, which silently downgrades every call to
+ * host candidates only (works on one LAN, nowhere else).
+ *
+ * There is deliberately no default TURN here. Relaying costs real bandwidth,
+ * so every relay worth pointing at needs credentials; the "free public TURN"
+ * endpoints that used to fill this slot now answer every allocation with an
+ * error. A default that silently fails is worse than none, because it hides
+ * the one thing an operator has to act on.
+ */
+const DEFAULT_STUN = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:stun.cloudflare.com:3478',
+];
+
 export const config = {
   port: int('PORT', 3001),
   nodeEnv: process.env.NODE_ENV ?? 'development',
@@ -113,6 +144,28 @@ export const config = {
    * frontend and this box handles signaling only, offloading all static I/O.
    */
   serveClient: bool('SERVE_CLIENT', true),
+
+  /**
+   * STUN/TURN served to browsers at runtime by `GET /ice`.
+   *
+   * Runtime rather than build time on purpose: Vite inlines `VITE_*` into the
+   * bundle, so changing a relay there means rebuilding and redeploying the
+   * SPA. Here it is an env change plus a restart — which is also what makes
+   * `turnSecret` (short-lived, per-request credentials) possible at all.
+   *
+   * Supply `turnUrls` plus EITHER `turnSecret` (coturn `use-auth-secret`,
+   * preferred: nothing long-lived ever reaches the browser) OR a static
+   * `turnUsername`/`turnCredential` pair (what managed providers hand out).
+   */
+  ice: {
+    stunUrls: list('STUN_URLS', DEFAULT_STUN),
+    turnUrls: list('TURN_URLS', []),
+    turnUsername: str('TURN_USERNAME', ''),
+    turnCredential: str('TURN_CREDENTIAL', ''),
+    turnSecret: str('TURN_SECRET', ''),
+    /** Lifetime of a generated credential. Must outlast the longest call. */
+    turnTtlSec: int('TURN_TTL_SEC', 24 * 60 * 60),
+  },
 } as const;
 
 export type Config = typeof config;

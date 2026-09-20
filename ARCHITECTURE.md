@@ -52,7 +52,7 @@ The brief asks for maximum quality (1080p/1440p/4K, 60fps, minimal compression/l
 
 **The trade-off is upload fan-out**: with N participants each client uploads N−1 copies. That's fine at 2 (the primary use case) and acceptable to ~4–5 at 1080p; we cap rooms at 8. **When an SFU becomes better:** >4–5 participants, mobile uplinks, or recording needs, then each client uploads once and the SFU fans out. The clean migration path is [LiveKit](https://livekit.io) (open source, self-hostable): swap `usePeerConnections` for LiveKit's React SDK and delete our signaling relay; room/chat/sync layers are transport-agnostic and stay unchanged. See `docs/ROADMAP.md`.
 
-- NAT traversal: STUN (Google's public servers) works for most pairs; strict NATs need TURN, configurable via `VITE_TURN_URL/USERNAME/CREDENTIAL` (coturn or a managed service). Without TURN, ~10–15% of pairs may fail to connect.
+- NAT traversal: STUN (Google + Cloudflare public servers) works for most pairs; strict NATs need TURN. The browser fetches its ICE servers from the signaling server at runtime (`GET /ice`), so relay credentials are server env (`TURN_URLS` plus `TURN_SECRET` for coturn's `use-auth-secret`, or a static `TURN_USERNAME`/`TURN_CREDENTIAL`) rather than values baked into the bundle at build time. Without TURN, ~10–15% of pairs fail to connect.
 
 ### 2. State: fully in-memory, no database
 

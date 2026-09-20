@@ -121,6 +121,23 @@ export interface RTCIceCandidateLike {
   usernameFragment?: string | null;
 }
 
+/**
+ * One STUN/TURN entry, structurally compatible with the browser's
+ * `RTCIceServer`. Served by `GET /ice` so relay credentials are a server-side
+ * env change (and can be rotated) instead of a value baked into the SPA at
+ * build time.
+ */
+export interface IceServerConfig {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+/** Response body of `GET /ice`. */
+export interface IceConfigResponse {
+  iceServers: IceServerConfig[];
+}
+
 export interface JoinRequest {
   code: string;
   name: string;

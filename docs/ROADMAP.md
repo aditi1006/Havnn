@@ -28,6 +28,6 @@ Deliberately deferred features, ordered by value, each with an implementation sk
 
 - Google Drive sync depends on Drive allowing direct download; fallback is unsynced (documented in FEATURES.md).
 - Force-mute is advisory (participant may unmute; matches Google Meet behavior).
-- No TURN bundled, strict-NAT pairs need `VITE_TURN_*` configured (DEPLOYMENT.md).
+- No TURN bundled, strict-NAT pairs need a relay configured via `TURN_URLS` (DEPLOYMENT.md).
 - Quality preset changes apply on next camera restart, not live (a live path via `applyConstraints` is a small follow-up).
 - Playlist reordering is add/remove/play-next only (no drag-sort yet).

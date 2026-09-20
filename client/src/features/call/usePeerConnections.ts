@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { SignalPayload } from '@syncroom/shared';
+import type { IceServerConfig, SignalPayload } from '@syncroom/shared';
 import { socket } from '@/lib/socket';
+import {
+  FORCE_TURN_FOR_TEST,
+  ICE_ENDPOINT,
+  describeIceServers,
+  getIceServers,
+  hasTurn,
+  peerConnectionConfig,
+} from '@/lib/iceConfig';
 import { QUALITY_MAX_BITRATE, useSettings } from '@/store/settings';
 import { useRoomStore } from '@/store/room';
 
@@ -19,64 +27,35 @@ interface PeerRecord {
   remoteMeta: Record<string, 'camera' | 'screen'>;
   camSenders: Partial<Record<'audio' | 'video', RTCRtpSender>>;
   screenSenders: Partial<Record<'audio' | 'video', RTCRtpSender>>;
-  /** Tail of this peer's in-order signal chain, see `applySignal`. */
-  queue: Promise<void>;
-}
-
-/** Verbose signaling/ICE tracing, dev-only: SDP and candidates are sensitive
- * enough (and noisy enough) that they should never hit a production console. */
-function debug(...args: unknown[]): void {
-  if (import.meta.env.DEV) console.log(...args);
 }
 
 /**
- * ICE configuration, tuned to keep media direct (P2P) and only relay when a
- * direct path is impossible.
- *
- * We list STUN first and TURN (if configured) second. With the default
- * `iceTransportPolicy: 'all'`, the browser gathers host + server-reflexive
- * (STUN) candidates and always *prefers* a direct connection; a TURN `relay`
- * candidate is used only when no direct pair can be established (strict/
- * symmetric NAT, ~10-15% of pairs). We never set `iceTransportPolicy: 'relay'`,
- * which would force every call through TURN and defeat the point of P2P.
- * VITE_TURN_URL may list several URLs (comma-separated), e.g. UDP + TCP/443.
+ * Verbose signaling/ICE tracing. Normally dev-only — SDP and candidates are
+ * sensitive and noisy enough that they should not hit a production console —
+ * but it also switches on while the relay test mode is active, because that
+ * test is run against the deployed site and is worthless without the candidate
+ * log. `VITE_WEBRTC_DEBUG=true` turns it on independently.
  */
-let turnWarningLogged = false;
+const TRACE =
+  import.meta.env.DEV ||
+  FORCE_TURN_FOR_TEST ||
+  (import.meta.env.VITE_WEBRTC_DEBUG as string | undefined)?.trim() === 'true';
 
-function iceServers(): RTCIceServer[] {
-  const servers: RTCIceServer[] = [
-    {
-      urls: [
-        'stun:stun.relay.metered.ca:80',
-      ],
-    },
-  ];
-
-  const turnUsername = import.meta.env.VITE_TURN_USERNAME as string | undefined;
-  const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL as string | undefined;
-
-  if (turnUsername && turnCredential) {
-    servers.push({
-      urls: [
-        'turn:global.relay.metered.ca:80',
-        'turn:global.relay.metered.ca:80?transport=tcp',
-        'turn:global.relay.metered.ca:443',
-        'turns:global.relay.metered.ca:443?transport=tcp',
-      ],
-      username: turnUsername,
-      credential: turnCredential,
-    });
-  } else if (!turnWarningLogged) {
-    turnWarningLogged = true;
-
-    console.warn(
-      '[webrtc] TURN credentials are not configured — calls between peers behind ' +
-      'strict/symmetric NATs may fail to connect.',
-    );
-  }
-
-  return servers;
+function debug(...args: unknown[]): void {
+  if (TRACE) console.log(...args);
 }
+
+/**
+ * ICE configuration comes from `@/lib/iceConfig`, which fetches it from the
+ * server's `GET /ice` (see that file). STUN comes first and TURN second, so
+ * with `iceTransportPolicy: 'all'` the browser gathers host + server-reflexive
+ * candidates and always *prefers* a direct connection; a TURN `relay` candidate
+ * is used only when no direct pair can be established (strict/symmetric NAT,
+ * ~10-15% of pairs).
+ *
+ * `FORCE_TURN_FOR_TEST` overrides that with `'relay'`, which suppresses every
+ * non-relay candidate so a successful call proves TURN itself works.
+ */
 
 /**
  * Full-mesh WebRTC with the "perfect negotiation" pattern. Each remote
@@ -108,6 +87,17 @@ export function usePeerConnections(options: {
 
   const selfId = useRoomStore((s) => s.selfId);
   const participants = useRoomStore((s) => s.room?.participants);
+
+  /** Read from async continuations that may outlive the call. */
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
+  /**
+   * Per-peer promise chain, keyed by peer id rather than held on the peer
+   * record, because the record itself is now created asynchronously and a
+   * signal can arrive before it exists.
+   */
+  const signalChains = useRef<Map<string, Promise<void>>>(new Map());
 
   const streamMeta = useCallback((): Record<string, 'camera' | 'screen'> => {
     const meta: Record<string, 'camera' | 'screen'> = {};
@@ -202,24 +192,36 @@ export function usePeerConnections(options: {
   }, [applySenderQuality]);
 
   const createPeer = useCallback(
-    (peerId: string): PeerRecord => {
-      const pc = new RTCPeerConnection({ iceServers: iceServers() });
+    (peerId: string, ice: IceServerConfig[]): PeerRecord => {
+      const pc = new RTCPeerConnection(peerConnectionConfig(ice));
+      debug(
+        `[webrtc] peer ${peerId}: RTCPeerConnection created — ${describeIceServers(ice)}, ` +
+          `iceTransportPolicy: ${peerConnectionConfig(ice).iceTransportPolicy}`,
+      );
       pc.onsignalingstatechange = () => {
         debug("[SIGNAL STATE]", peerId, pc.signalingState);
       };
 
       pc.onconnectionstatechange = async () => {
-        debug("[CONNECTION STATE]", peerId, pc.connectionState);
+        debug('[webrtc] connection state:', peerId, pc.connectionState);
 
         if (pc.connectionState === "connected") {
           const stats = await pc.getStats();
-
+          // Resolve the nominated pair to real candidate rows so the log says
+          // which transport actually carried the call (`relay` = via TURN).
           stats.forEach((report) => {
             if (report.type === "candidate-pair" && report.state === "succeeded") {
-              debug("[SELECTED ICE PAIR]", {
-                localCandidateId: report.localCandidateId,
-                remoteCandidateId: report.remoteCandidateId,
-                nominated: report.nominated,
+              const local = stats.get(report.localCandidateId as string) as
+                | { candidateType?: string; protocol?: string }
+                | undefined;
+              const remote = stats.get(report.remoteCandidateId as string) as
+                | { candidateType?: string }
+                | undefined;
+              debug('[webrtc] selected pair:', peerId, {
+                local: local?.candidateType,
+                remote: remote?.candidateType,
+                protocol: local?.protocol,
+                viaTurnRelay: local?.candidateType === 'relay' || remote?.candidateType === 'relay',
               });
             }
           });
@@ -237,7 +239,6 @@ export function usePeerConnections(options: {
         remoteMeta: {},
         camSenders: {},
         screenSenders: {},
-        queue: Promise.resolve(),
       };
 
       pc.onnegotiationneeded = async (): Promise<void> => {
@@ -273,16 +274,19 @@ export function usePeerConnections(options: {
         }
       };
 
-      pc.onicecandidate = (ev): void => {
-        debug("[ICE OUT]", ev.candidate);
+      // Whether a relay candidate was ever gathered is the single fact that
+      // separates "TURN is broken/missing" from every other reason a tile
+      // stays black, so it is tracked and reported explicitly.
+      let sawRelayCandidate = false;
+      let candidateCount = 0;
 
+      pc.onicecandidate = (ev): void => {
         if (ev.candidate) {
-          debug("[ICE CANDIDATE TYPE]", {
-            type: ev.candidate.type,
-            protocol: ev.candidate.protocol,
-            address: ev.candidate.address,
-            port: ev.candidate.port,
-          });
+          candidateCount += 1;
+          if (ev.candidate.type === 'relay') sawRelayCandidate = true;
+          // The raw candidate line is logged verbatim so `typ relay` is
+          // greppable straight out of the browser console during TURN testing.
+          debug(`[webrtc] ICE candidate (${peerId}):`, ev.candidate.candidate);
 
           socket.emit('signal', {
             to: peerId,
@@ -291,8 +295,27 @@ export function usePeerConnections(options: {
           });
         }
       };
+
+      pc.onicegatheringstatechange = (): void => {
+        debug('[webrtc] ICE gathering state:', peerId, pc.iceGatheringState);
+        if (pc.iceGatheringState !== 'complete') return;
+
+        const summary = `${candidateCount} candidate(s), relay candidate: ${sawRelayCandidate ? 'YES' : 'NO'}`;
+        if (sawRelayCandidate) {
+          debug(`[webrtc] gathering complete for ${peerId} — ${summary}`);
+        } else {
+          // Always a warning: with relay-only this guarantees failure, and
+          // with the normal policy it means strict-NAT peers cannot connect.
+          console.warn(
+            `[webrtc] gathering complete for ${peerId} — ${summary}. No TURN relay candidate ` +
+              'was gathered: check TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL on the server and ' +
+              `that GET /ice returns them.${FORCE_TURN_FOR_TEST ? ' Relay-only test mode is on, so this connection cannot succeed.' : ''}`,
+          );
+        }
+      };
+
       pc.oniceconnectionstatechange = (): void => {
-        debug("[ICE STATE]", peerId, pc.iceConnectionState);
+        debug('[webrtc] ICE connection state:', peerId, pc.iceConnectionState);
         const state = pc.iceConnectionState;
 
         if (state === 'failed') {
@@ -300,6 +323,17 @@ export function usePeerConnections(options: {
             clearTimeout(disconnectTimer);
             disconnectTimer = undefined;
           }
+          // Warn (not `debug`) so this survives into production: a failed ICE
+          // negotiation is exactly the black tile users report, and without a
+          // line here there is nothing to go on.
+          console.warn(
+            `[webrtc] ICE failed for peer ${peerId}, restarting.` +
+              (sawRelayCandidate
+                ? ' A relay candidate was gathered, so TURN allocation worked — the relay' +
+                  ' may be unreachable from the remote peer, or its credentials expired.'
+                : ' No relay candidate was gathered, so a strict/symmetric NAT on either' +
+                  ' side cannot be traversed — check TURN config (docs/DEPLOYMENT.md).'),
+          );
           debug("[ICE RESTART]", peerId);
           pc.restartIce();
         } else if (state === 'disconnected') {
@@ -348,6 +382,50 @@ export function usePeerConnections(options: {
     [selfId, streamMeta, removeFeedsFor],
   );
 
+  /**
+   * The single entry point for opening a connection. Every RTCPeerConnection in
+   * the app is built here, from the ICE servers `GET /ice` returned — so a peer
+   * is never created with a guessed or empty configuration.
+   *
+   * Async because the config is fetched. The fetch is cached after the first
+   * call, so this is a round trip once per page load and a resolved promise
+   * afterwards.
+   */
+  const ensurePeer = useCallback(
+    async (peerId: string): Promise<PeerRecord | null> => {
+      const existing = peersRef.current.get(peerId);
+      if (existing) return existing;
+
+      const ice = await getIceServers();
+      if (!activeRef.current) return null; // call ended while we were fetching
+
+      // Another signal for the same peer may have won the race while awaiting.
+      const raced = peersRef.current.get(peerId);
+      if (raced) return raced;
+
+      const peer = createPeer(peerId, ice);
+      syncAllTracks();
+      return peer;
+    },
+    [createPeer, syncAllTracks],
+  );
+
+  /**
+   * Surfaces an ICE-config failure through the app's existing toast mechanism.
+   * The message is deliberately generic: `err` can name the endpoint but must
+   * never carry TURN credentials into the UI.
+   */
+  const reportIceFailure = useCallback((err: unknown): void => {
+    console.error('[webrtc] could not load ICE servers from', ICE_ENDPOINT, err);
+    useRoomStore
+      .getState()
+      .toast(
+        'error',
+        'Could not reach the connection service, so video cannot start. Retry in a moment.',
+        'ice-config-failed',
+      );
+  }, []);
+
   /** Incoming signaling, one listener for all peers. */
   useEffect(() => {
     if (!active) return;
@@ -395,25 +473,58 @@ export function usePeerConnections(options: {
 
       const peerId = payload.from;
       if (!peerId || peerId === selfId) return;
-      let peer = peersRef.current.get(peerId);
-      if (!peer) {
-        peer = createPeer(peerId);
-        syncAllTracks();
-      }
-      // Apply strictly in arrival order. `applySignal` awaits, so firing each
-      // packet independently lets an ICE candidate overtake the offer it
-      // belongs to: `addIceCandidate` then rejects (no remote description yet)
-      // and that candidate is lost for good, stranding ICE in `checking` with
-      // a black tile. Chaining per peer keeps offer → answer → candidates in
-      // the order the server relayed them.
-      const target = peer;
-      peer.queue = peer.queue.then(() => applySignal(target, payload));
+
+      // Apply strictly in arrival order. Both `ensurePeer` (it fetches /ice)
+      // and `applySignal` await, so firing each packet independently lets an
+      // ICE candidate overtake the offer it belongs to: `addIceCandidate` then
+      // rejects (no remote description yet) and that candidate is lost for
+      // good, stranding ICE in `checking` with a black tile. Chaining per peer
+      // keeps offer → answer → candidates in the order the server relayed them.
+      const prev = signalChains.current.get(peerId) ?? Promise.resolve();
+      const next = prev
+        .then(async () => {
+          const peer = await ensurePeer(peerId);
+          if (peer) await applySignal(peer, payload);
+        })
+        .catch(reportIceFailure);
+      signalChains.current.set(peerId, next);
     };
     socket.on('signal', handler);
     return () => {
       socket.off('signal', handler);
     };
-  }, [active, selfId, createPeer, streamMeta, syncAllTracks]);
+  }, [active, selfId, ensurePeer, reportIceFailure, streamMeta]);
+
+  /**
+   * Warm the ICE config as soon as the room page mounts, so the first
+   * connection does not pay for the round trip, and so a misconfigured `/ice`
+   * is reported while the user is still in the lobby rather than mid-call.
+   */
+  useEffect(() => {
+    void getIceServers().then(
+      (servers) => {
+        debug(`[webrtc] ICE config loaded from ${ICE_ENDPOINT} — ${describeIceServers(servers)}`);
+        if (FORCE_TURN_FOR_TEST) {
+          console.warn(
+            '[webrtc] TURN TEST MODE is ON (iceTransportPolicy: "relay"). All media is forced ' +
+              'through the TURN relay — this verifies TURN works but is not a production ' +
+              'setting. Disable with VITE_FORCE_TURN=false (see client/src/lib/iceConfig.ts).',
+          );
+        }
+        if (!hasTurn(servers)) {
+          console.warn(
+            '[webrtc] No TURN relay in the /ice response. Peers on the same network still ' +
+              'connect, but a pair behind strict/symmetric NAT (~10-15%) will join the room ' +
+              'and never exchange video. Set TURN_URLS + TURN_USERNAME/TURN_CREDENTIAL on the ' +
+              'signaling server — see docs/DEPLOYMENT.md.',
+          );
+        }
+      },
+      // Not surfaced to the user here: nothing is broken until a call is
+      // actually attempted, and `ensurePeer` reports it then.
+      (err: unknown) => console.error('[webrtc] ICE config preload failed:', err),
+    );
+  }, []);
 
   /** Open connections to newcomers; tear down leavers. */
   useEffect(() => {
@@ -423,18 +534,19 @@ export function usePeerConnections(options: {
 
     for (const peerId of current) {
       if (!peersRef.current.has(peerId)) {
-        createPeer(peerId);
+        void ensurePeer(peerId).catch(reportIceFailure);
       }
     }
     for (const [peerId, peer] of peersRef.current) {
       if (!current.has(peerId)) {
         peer.pc.close();
         peersRef.current.delete(peerId);
+        signalChains.current.delete(peerId);
         removeFeedsFor(peerId);
       }
     }
     syncAllTracks();
-  }, [active, selfId, participants, createPeer, removeFeedsFor, syncAllTracks]);
+  }, [active, selfId, participants, ensurePeer, reportIceFailure, removeFeedsFor, syncAllTracks]);
 
   /** Keep senders in step with the local streams. */
   useEffect(() => {
@@ -457,6 +569,7 @@ export function usePeerConnections(options: {
       debug('[RECONNECT] rebuilding peer mesh');
       for (const peer of peersRef.current.values()) peer.pc.close();
       peersRef.current.clear();
+      signalChains.current.clear();
       setFeeds([]);
     };
     socket.io.on('reconnect', onReconnect);
@@ -468,14 +581,17 @@ export function usePeerConnections(options: {
   /** Full teardown when the call ends AND on unmount (no leaked RTCPeerConnections). */
   useEffect(() => {
     const peers = peersRef.current; // stable Map instance for the hook's lifetime
+    const chains = signalChains.current;
     if (!active) {
       for (const peer of peers.values()) peer.pc.close();
       peers.clear();
+      chains.clear();
       setFeeds([]);
     }
     return () => {
       for (const peer of peers.values()) peer.pc.close();
       peers.clear();
+      chains.clear();
     };
   }, [active]);
 

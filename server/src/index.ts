@@ -13,6 +13,7 @@ import { driveProxy, QUALITY_HEADERS } from './driveProxy';
 import { resolveFfmpeg, TranscodeError, transcodeManager } from './transcode';
 import { isOriginAllowed, makeOriginCheck, parseAllowedOrigins } from './cors';
 import { config } from './config';
+import { buildIceServers, createIceHandler, hasTurn } from './ice';
 import { ConnectionGate } from './connectionGate';
 
 const ALLOWED_ORIGINS = parseAllowedOrigins(process.env.CLIENT_ORIGIN);
@@ -28,6 +29,18 @@ if (selfOrigin && !ALLOWED_ORIGINS.includes(selfOrigin)) {
 }
 console.log(`[syncroom] allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
 
+// Whether strict-NAT peers can connect at all is decided entirely here, so say
+// so at boot rather than leaving it to be discovered later as "video sometimes
+// doesn't arrive".
+const bootIce = buildIceServers(config.ice);
+console.log(
+  hasTurn(bootIce)
+    ? `[syncroom] TURN relay: ${config.ice.turnUrls.join(', ')} (${config.ice.turnSecret ? 'ephemeral credentials' : 'static credentials'})`
+    : '[syncroom] TURN relay: NOT CONFIGURED — peers behind strict/symmetric NAT (~10-15%) ' +
+        'will connect to the room but never exchange video. Set TURN_URLS plus TURN_SECRET ' +
+        '(coturn use-auth-secret) or TURN_USERNAME/TURN_CREDENTIAL. See docs/DEPLOYMENT.md.',
+);
+
 if (!config.isProduction) {
   console.warn(`[syncroom] NODE_ENV=${config.nodeEnv} (set NODE_ENV=production in deployment)`);
 }
@@ -38,6 +51,21 @@ app.disable('x-powered-by');
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true, uptime: process.uptime(), connections: io.engine.clientsCount });
 });
+
+// STUN/TURN handed to browsers at runtime. Keeping this out of the client
+// bundle is what makes relay credentials operable: `VITE_*` values are inlined
+// at build time, so changing TURN there means rebuilding and redeploying the
+// SPA, whereas this is an env var plus a restart. Registered here, well ahead
+// of the SPA catch-all at the bottom of this file — a server that predates
+// this route answers `/ice` with index.html rather than a 404, which the
+// client detects and reports (see client/src/lib/iceConfig.ts).
+app.get(
+  '/ice',
+  createIceHandler({
+    ice: config.ice,
+    allowOrigin: (origin) => isOriginAllowed(origin, ALLOWED_ORIGINS),
+  }),
+);
 
 // Streams a public Google Drive file so it plays in the synced HTML5 player
 // instead of Drive's un-syncable preview iframe. This is the ONLY path where
