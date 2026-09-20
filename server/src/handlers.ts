@@ -140,7 +140,16 @@ export function registerHandlers(
       }
 
       let room = rooms.get(code);
-      if (req.create) {
+      // A member reclaiming their identity (tab refresh, or a transport drop
+      // followed by a socket.io reconnect) re-sends `create` so the room is
+      // rebuilt if the server restarted while they were away. That must never
+      // be read as "create a brand-new room": the `room-exists` guard only
+      // applies to someone who is not already a member here. Without this the
+      // rejoin is refused whenever anyone else is still connected, the member
+      // falls out of the participant list after the grace window, and every
+      // peer tears their RTCPeerConnection down, no video either way.
+      const returning = room?.findByKey(key);
+      if (req.create && !returning) {
         if (room && room.connectedCount > 0) {
           ack({ ok: false, reason: 'room-exists' });
           return;
@@ -156,7 +165,6 @@ export function registerHandlers(
         return;
       }
 
-      const returning = room.findByKey(key);
       if (returning && returning.socketId !== null && returning.socketId !== socket.id) {
         ack({ ok: false, reason: 'duplicate' });
         return;

@@ -19,6 +19,8 @@ interface PeerRecord {
   remoteMeta: Record<string, 'camera' | 'screen'>;
   camSenders: Partial<Record<'audio' | 'video', RTCRtpSender>>;
   screenSenders: Partial<Record<'audio' | 'video', RTCRtpSender>>;
+  /** Tail of this peer's in-order signal chain, see `applySignal`. */
+  queue: Promise<void>;
 }
 
 /** Verbose signaling/ICE tracing, dev-only: SDP and candidates are sensitive
@@ -235,6 +237,7 @@ export function usePeerConnections(options: {
         remoteMeta: {},
         camSenders: {},
         screenSenders: {},
+        queue: Promise.resolve(),
       };
 
       pc.onnegotiationneeded = async (): Promise<void> => {
@@ -349,16 +352,9 @@ export function usePeerConnections(options: {
   useEffect(() => {
     if (!active) return;
 
-    const onSignal = async (payload: SignalPayload): Promise<void> => {
-      debug("[SIGNAL IN]", payload);
-
+    /** Applies one signal. Runs to completion before the peer's next one. */
+    const applySignal = async (peer: PeerRecord, payload: SignalPayload): Promise<void> => {
       const peerId = payload.from;
-      if (!peerId || peerId === selfId) return;
-      let peer = peersRef.current.get(peerId);
-      if (!peer) {
-        peer = createPeer(peerId);
-        syncAllTracks();
-      }
       if (payload.streamMeta) peer.remoteMeta = { ...peer.remoteMeta, ...payload.streamMeta };
       const { pc } = peer;
 
@@ -395,7 +391,23 @@ export function usePeerConnections(options: {
     };
 
     const handler = (payload: SignalPayload): void => {
-      void onSignal(payload);
+      debug("[SIGNAL IN]", payload);
+
+      const peerId = payload.from;
+      if (!peerId || peerId === selfId) return;
+      let peer = peersRef.current.get(peerId);
+      if (!peer) {
+        peer = createPeer(peerId);
+        syncAllTracks();
+      }
+      // Apply strictly in arrival order. `applySignal` awaits, so firing each
+      // packet independently lets an ICE candidate overtake the offer it
+      // belongs to: `addIceCandidate` then rejects (no remote description yet)
+      // and that candidate is lost for good, stranding ICE in `checking` with
+      // a black tile. Chaining per peer keeps offer → answer → candidates in
+      // the order the server relayed them.
+      const target = peer;
+      peer.queue = peer.queue.then(() => applySignal(target, payload));
     };
     socket.on('signal', handler);
     return () => {
@@ -428,6 +440,30 @@ export function usePeerConnections(options: {
   useEffect(() => {
     syncAllTracks();
   }, [localStream, screenStream, syncAllTracks]);
+
+  /**
+   * A transport drop invalidates the whole mesh. The moment the server marks
+   * this client offline it disappears from everyone's participant list, so
+   * every remote peer closes its RTCPeerConnection to us — but the ones we
+   * hold are left behind, half-dead and pointing at certificates/ICE
+   * credentials the other side has already thrown away. Feeding the fresh
+   * offers that follow a rejoin into those stale connections either fails
+   * outright (mismatched m-lines) or leaves a frozen tile. Drop them here and
+   * let the rejoin's `room:state` rebuild the mesh symmetrically.
+   */
+  useEffect(() => {
+    if (!active) return;
+    const onReconnect = (): void => {
+      debug('[RECONNECT] rebuilding peer mesh');
+      for (const peer of peersRef.current.values()) peer.pc.close();
+      peersRef.current.clear();
+      setFeeds([]);
+    };
+    socket.io.on('reconnect', onReconnect);
+    return () => {
+      socket.io.off('reconnect', onReconnect);
+    };
+  }, [active]);
 
   /** Full teardown when the call ends AND on unmount (no leaked RTCPeerConnections). */
   useEffect(() => {

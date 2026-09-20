@@ -176,19 +176,34 @@ export function RoomPage() {
     const onReconnect = (): void => {
       startClockSync();
       const st = useRoomStore.getState();
-      if (st.joined && sessionStorage.getItem(IN_ROOM_KEY) === code) {
-        const name = st.room?.participants.find((p) => p.id === st.selfId)?.name ?? 'Guest';
+      if (!st.joined || sessionStorage.getItem(IN_ROOM_KEY) !== code) return;
+      const name = st.room?.participants.find((p) => p.id === st.selfId)?.name ?? 'Guest';
+
+      // `create` covers one case only: the server restarted while we were away
+      // and the room went with it. Sending it on every rejoin made an ordinary
+      // reconnect look like an attempt to create a room that already exists,
+      // which the server refuses (`room-exists`) whenever anyone else is still
+      // connected, so the dropped member never got back in, dropped out of the
+      // participant list, and every peer tore their video down. Rejoin plainly
+      // first and only recreate when the room really is gone. A failure is
+      // surfaced now instead of leaving the tab silently orphaned.
+      const attempt = (create: boolean): void => {
         socket.emit(
           'room:join',
-          { code, name, participantKey: getParticipantKey(), create: true },
+          { code, name, participantKey: getParticipantKey(), create },
           (res) => {
             if (res.ok && res.selfId && res.room) {
               st.setJoined(res.selfId, res.room, res.chatHistory ?? []);
               st.toast('success', 'Reconnected.');
+            } else if (!create && res.reason === 'not-found') {
+              attempt(true);
+            } else {
+              st.toast('error', JOIN_ERRORS[res.reason ?? 'not-found']);
             }
           },
         );
-      }
+      };
+      attempt(false);
     };
     socket.io.on('reconnect', onReconnect);
     return () => {

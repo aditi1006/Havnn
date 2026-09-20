@@ -240,6 +240,43 @@ describe('room lifecycle over sockets', () => {
     expect(sig.description?.type).toBe('offer');
   });
 
+  it('lets a dropped member rejoin while the rest of the room is connected', async () => {
+    const a = client();
+    const b = client();
+    await join(a, { code: 'recon-rm', name: 'A', key: 'recon-a-0001', create: true });
+    const bJoin = await join(b, { code: 'recon-rm', name: 'B', key: 'recon-b-0001' });
+    expect(bJoin.ok).toBe(true);
+
+    // Transport drop: B's socket dies and socket.io-client reconnects on a
+    // brand-new one. The rejoin may carry `create` (the room would be gone if
+    // the server had restarted) and must still be admitted as the same member,
+    // otherwise B falls out of the participant list and every peer tears down
+    // B's RTCPeerConnection.
+    b.disconnect();
+    await new Promise((r) => setTimeout(r, 100));
+
+    const b2 = client();
+    const rejoin = await join(b2, {
+      code: 'recon-rm',
+      name: 'B',
+      key: 'recon-b-0001',
+      create: true,
+    });
+    expect(rejoin.ok).toBe(true);
+    expect(rejoin.selfId).toBe(bJoin.selfId);
+    expect(rejoin.room?.participants).toHaveLength(2);
+
+    // The guard still holds for someone who is not already a member.
+    const stranger = client();
+    const denied = await join(stranger, {
+      code: 'recon-rm',
+      name: 'C',
+      key: 'recon-c-0001',
+      create: true,
+    });
+    expect(denied).toMatchObject({ ok: false, reason: 'room-exists' });
+  });
+
   it('answers time pings with server time', async () => {
     const c = client();
     const serverNow = await new Promise<number>((resolve) => {
